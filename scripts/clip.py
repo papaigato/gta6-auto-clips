@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Clipper: transforma lives e vídeos longos em cortes verticais prontos pra postar.
+
+Comandos (depois do instalar, use o atalho ~/clipper-gta6/clip no lugar de "clip.py"):
+  clip instalar                       confere e instala tudo que falta (também atualiza)
+  clip buscar [--quantas 7]           acha as maiores lives de GTA 6 de hoje que já acabaram
+  clip preparar LINK [LINK…]          baixa o áudio, escuta e separa os trechos mais quentes (candidatos.txt)
+  clip capitulos LIVE                 transforma os capítulos do vídeo em momentos (vídeo com capítulos)
+  clip escolher LIVE [--manter 3] [--perfil impacto|explicativo|livre]
+  clip fazer LIVE [--estilo auto|split|blur|preencher] [--foco 0.5]
+  clip automatico LINK [--quantos 3]  tudo sozinho, sem a IA ler (títulos mais simples)
+  clip status                         mostra em que passo cada live está
+  clip tiktok instalar|add|add-live|list|run [...]   fila de postagem no TikTok (opcional)
+
+Os passos demorados rodam em segundo plano: se aparecer AINDA TRABALHANDO, é só rodar o mesmo comando de novo.
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+AQUI = Path(__file__).resolve().parent
+sys.path.insert(0, str(AQUI))
+from comum import (CASA, CORTES, MODELOS, TRABALHO, YUNET, YUNET_URL, ffmpeg_embutido, gravar_json, hms, ler_json,
+                   pasta_da_live, tem)  # noqa: E402
+
+VENV = CASA / "ambiente"
+VENV_PY = VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+PACOTES = ["faster-whisper", "opencv-python-headless", "numpy", "yt-dlp[default]", "certifi", "static-ffmpeg", "deno"]
+
+
+def no_ambiente():
+    """Roda sempre com o Python do próprio clipper, que o instalar cria."""
+    if VENV_PY.exists() and Path(sys.prefix).resolve() != VENV.resolve() and sys.argv[1:2] != ["instalar"]:
+        os.execv(str(VENV_PY), [str(VENV_PY), __file__, *sys.argv[1:]])
+
+
+def instalar(_):
+    print("Conferindo o que o computador precisa…\n")
+    falta = []
+    if sys.version_info < (3, 10):
+        falta.append("python")
+        print(f"  ✗ Python {sys.version.split()[0]} é antigo. Precisa do 3.10 ou mais novo.")
+        if os.name == "nt":
+            print("      Instale com:  winget install -e --id Python.Python.3.12 --scope user"
+                  "   (depois feche e abra o terminal)")
+        else:
+            print("      Baixe o instalador oficial em https://www.python.org/downloads/ e abra o arquivo.")
+    else:
+        print(f"  ✓ Python {sys.version.split()[0]}")
+    if "python" not in falta:
+        if VENV_PY.exists():
+            # ambiente criado com outro Python (ex.: um 3.15 sem pacotes prontos): apaga e refaz com o Python certo
+            r = subprocess.run([str(VENV_PY), "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+                               capture_output=True, text=True)
+            if r.stdout.strip() != "%d.%d" % sys.version_info[:2]:
+                print("  … refazendo o ambiente do clipper com o Python", sys.version.split()[0])
+                shutil.rmtree(VENV, ignore_errors=True)
+        if not VENV_PY.exists():
+            print("  … criando o ambiente do clipper em", VENV)
+            subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
+        print("  … instalando pacotes:", ", ".join(PACOTES))
+        subprocess.run([str(VENV_PY), "-m", "pip", "install", "-q", "--upgrade", "pip"], check=True)
+        subprocess.run([str(VENV_PY), "-m", "pip", "install", "-q", "--upgrade", *PACOTES], check=True)
+        print("  ✓ pacotes do Python")
+        if tem("ffmpeg") and tem("ffprobe"):
+            print("  ✓ ffmpeg")
+        else:
+            print("  … baixando o ffmpeg (programa que monta os vídeos, uma vez só)")
+            r = subprocess.run([str(VENV_PY), "-c", "import sys,static_ffmpeg,shutil;static_ffmpeg.add_paths();"
+                                "sys.exit(0 if shutil.which('ffmpeg') and shutil.which('ffprobe') else 1)"])
+            if r.returncode == 0:
+                print("  ✓ ffmpeg")
+            else:
+                falta.append("ffmpeg")
+                print("  ✗ não consegui baixar o ffmpeg. Confira a internet e rode 'clip.py instalar' de novo.")
+    if not YUNET.exists():
+        print("  … baixando o detector de rosto (OpenCV YuNet, 0,2 MB)")
+        MODELOS.mkdir(parents=True, exist_ok=True)
+        if tem("curl"):  # Mac e Windows 10+ já vêm com curl (o Python do python.org às vezes não acha os certificados)
+            subprocess.run(["curl", "-fsSL", "-o", str(YUNET), YUNET_URL], check=True)
+        else:
+            subprocess.run([str(VENV_PY), "-c", "import sys,ssl,certifi,urllib.request as u;"
+                            "c=ssl.create_default_context(cafile=certifi.where());"
+                            "open(sys.argv[2],'wb').write(u.urlopen(sys.argv[1],context=c).read())",
+                            YUNET_URL, str(YUNET)], check=True)
+    print("  ✓ detector de rosto")
+    if "python" not in falta:
+        print("  … baixando os modelos de escuta (base e small, uma vez só)")
+        subprocess.run([str(VENV_PY), "-c", "from faster_whisper import WhisperModel as W; W('base'); W('small')"],
+                       check=True)
+        print("  ✓ modelos de escuta")
+    for p in (TRABALHO, CORTES):
+        p.mkdir(parents=True, exist_ok=True)
+    if falta:
+        print("\nFALTA:", ", ".join(falta), "— instale e rode 'clip.py instalar' de novo.")
+        sys.exit(1)
+    atalhos()
+    print(f"\nTUDO PRONTO. Os cortes vão sair em {CORTES}")
+
+
+def atalhos():
+    """Cria o atalho ~/clipper-gta6/clip (e clip.cmd no Windows): a IA não precisa achar Python nem pasta."""
+    script = Path(__file__).resolve()
+    sh = CASA / "clip"
+    sh.write_text(f'#!/bin/sh\nexec "{VENV_PY.as_posix()}" "{script.as_posix()}" "$@"\n', encoding="utf-8")
+    try:
+        sh.chmod(0o755)
+    except OSError:
+        pass
+    if os.name == "nt":
+        (CASA / "clip.cmd").write_text(f'@"{VENV_PY}" "{script}" %*\r\n', encoding="utf-8")
+    print(f"  ✓ atalho: {sh}" + (f"  (PowerShell: {CASA / 'clip.cmd'})" if os.name == "nt" else ""))
+
+
+GTA6 = __import__("re").compile(r"gta\s*-?\s*(6|vi)(?![0-9a-z])", 2)
+GTA5 = __import__("re").compile(r"gta\s*-?\s*(5|v|iv|4|rp)(?![0-9a-z])", 2)
+
+
+def buscar(a):
+    import json
+    from comum import ytdlp
+    # filtros oficiais da busca do YouTube: "Hoje" + "Mais de 20 minutos"
+    filtro = "EgQIAhgC"
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import quote_plus
+
+    def pesquisar(termo):
+        url = f"https://www.youtube.com/results?search_query={quote_plus(termo)}&sp={filtro}"
+        r = subprocess.run(ytdlp() + ["--flat-playlist", "-J", "--playlist-end", "40", "--no-warnings", url],
+                           capture_output=True, text=True)
+        try:
+            return json.loads(r.stdout).get("entries", []) or []
+        except json.JSONDecodeError:
+            return []
+
+    vistos = {}
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        resultados = list(pool.map(pesquisar, a.termos))
+    for itens in resultados:
+        for v in itens:
+            titulo = v.get("title") or ""
+            if (v.get("id") and (v.get("duration") or 0) >= 30 * 60 and GTA6.search(titulo)
+                    and not GTA5.search(titulo)):
+                vistos[v["id"]] = v
+
+    def checar(v):  # pula live trancada (idade, membros, privada) e live que ainda está ao vivo
+        r = subprocess.run(ytdlp() + ["--print", "%(live_status)s", "--no-warnings", "-q",
+                                      f"https://www.youtube.com/watch?v={v['id']}"], capture_output=True, text=True)
+        return r.returncode, r.stdout.strip()
+
+    top = sorted(vistos.values(), key=lambda v: -(v.get("view_count") or 0))[: a.quantas * 3]
+    with ThreadPoolExecutor(max_workers=6) as pool:  # confere várias de uma vez (antes era uma por uma)
+        checagens = list(pool.map(checar, top))
+    lista = []
+    for v, (codigo, situacao) in zip(top, checagens):
+        if len(lista) >= a.quantas:
+            break
+        if codigo == 0 and situacao not in ("is_live", "is_upcoming", "post_live"):
+            lista.append(v)
+        else:
+            motivo = "ainda ao vivo" if situacao in ("is_live", "is_upcoming", "post_live") else "trancada"
+            print(f"  (pulei '{(v.get('title') or '')[:55]}': {motivo})")
+    if not lista:
+        print("Não achei lives longas de GTA 6 publicadas hoje. Tente com um link direto.")
+        return
+    print(f"As {len(lista)} maiores lives de GTA 6 de hoje:\n")
+    for i, v in enumerate(lista, 1):
+        views = f"{v.get('view_count') or 0:,}".replace(",", ".")  # só no número (antes trocava a vírgula do título)
+        print(f"  {i}. {v.get('title')}\n     {v.get('channel') or v.get('uploader')} | "
+              f"{hms(v.get('duration') or 0)} | {views} views\n"
+              f"     https://www.youtube.com/watch?v={v['id']}\n")
+
+
+AINDA = ("\nAINDA TRABALHANDO (é normal, live longa demora). O trabalho continua sozinho em segundo plano.\n"
+         "Rode este MESMO comando de novo pra acompanhar. Nada recomeça do zero.")
+
+
+def _rodar_trabalho(pasta, nome, argv, espera):
+    import tarefa
+    situacao = tarefa.acompanhar(pasta, nome, argv, espera)
+    if situacao == "rodando":
+        print(AINDA)
+        return False
+    if situacao == "erro":
+        msg = tarefa.explicar_erro(pasta, nome)
+        if "NÃO" in msg or "NAO" in msg:
+            print("\n  ✗ " + msg.strip())
+        sys.exit("\nDEU ERRO (mostrei acima). Rode o mesmo comando de novo: ele continua de onde parou. "
+                 "Se repetir, rode 'instalar' antes.")
+    return True
+
+
+def preparar(a):
+    from ouvir import ler_live
+    for link in a.links:
+        pasta = ler_live(link)
+        argv = [str(pasta), a.modelo or "", a.idioma or "", str(a.trechos)]
+        if not _rodar_trabalho(pasta, "preparar", argv, a.esperar):
+            return
+        print(f"\nPRONTO PRA ESCOLHER: {pasta.name}")
+        print(f"  Leia: {pasta / 'candidatos.txt'}")
+        print(f"  Escreva os momentos em: {pasta / 'momentos' / 'candidatos.json'}")
+        print(f"  Depois rode: escolher {pasta.name} --manter 3   (ou 5, ou quantos a pessoa pediu)")
+
+
+def escolher(a):
+    import tarefa
+    from cortar import escolher as esc
+    pasta = pasta_da_live(a.live)
+    if not (pasta / "candidatos.txt").exists():
+        sys.exit("Essa live ainda não terminou de ser escutada. Rode antes: preparar LINK")
+    if tarefa.rodando(pasta, "fazer"):  # checa antes de gravar a escolha nova
+        sys.exit("O passo 'fazer' ainda está rodando nessa live. Espere terminar e escolha de novo.")
+    esc(pasta, a.manter, auto=a.auto, perfil=a.perfil)
+    tarefa.limpar(pasta, "fazer")  # escolheu de novo: o próximo 'fazer' monta o que mudou
+    print(f"\nPróximo: fazer {pasta.name}")
+
+
+def aplicar_visual(a, pasta):
+    """Grava o visual escolhido em visual.json (o trabalho em segundo plano lê de lá).
+    Ordem: --estilo/--foco > CLIPPER_ESTILO/CLIPPER_FOCO > o que já estava salvo. Só refaz se mudou."""
+    import tarefa
+    from cortar import ler_visual
+    atual = ler_visual(pasta)
+    novo = dict(atual)
+    for chave, var in (("estilo", "CLIPPER_ESTILO"), ("foco", "CLIPPER_FOCO")):
+        v = getattr(a, chave, None)
+        v = v if v is not None else os.environ.get(var)
+        if v is not None:
+            novo[chave] = float(v) if chave == "foco" else str(v).lower()
+    if novo != atual or not (pasta / "visual.json").exists():
+        if novo != atual:
+            tarefa.limpar(pasta, "fazer")  # recusa se um 'fazer' estiver rodando
+        gravar_json(pasta / "visual.json", novo)
+
+
+def capitulos(a):
+    from cortar import momentos_de_capitulos
+    pasta = pasta_da_live(a.live)
+    caps = momentos_de_capitulos(pasta)
+    if not caps:
+        sys.exit("Esse vídeo não tem capítulos. Leia os blocos/ e escreva os momentos por assunto.")
+    print(f"{len(caps)} capítulos salvos em {pasta / 'momentos' / 'capitulos.json'}")
+    print(f"Próximo: escolher {pasta.name} --perfil livre --manter {len(caps)}")
+
+
+def fazer(a):
+    pasta = pasta_da_live(a.live)
+    if not (pasta / "escolhidos.json").exists():
+        sys.exit("Nenhum corte escolhido ainda. Rode antes: escolher " + pasta.name)
+    aplicar_visual(a, pasta)
+    if _rodar_trabalho(pasta, "fazer", [str(pasta), a.modelo or ""], a.esperar):
+        from comum import CORTES
+        print(f"\nCORTES PRONTOS em {CORTES / pasta.name} (cada .mp4 tem um .txt com a legenda do post)")
+
+
+def automatico(a):
+    """Tudo sozinho, sem a IA ler nada: escuta, pega os trechos mais quentes e monta. Pra IA fraca ou com pressa."""
+    import tarefa
+    from cortar import escolher as esc
+    from ouvir import candidatos, ler_live, picos_do_chat
+    pasta = ler_live(a.link)
+    aplicar_visual(a, pasta)
+    forcar = os.environ.get("CLIPPER_FORCAR_REFAZER", "0") == "1"
+    if not _rodar_trabalho(pasta, "preparar", [str(pasta), "", "", str(a.quantos)], a.esperar):
+        return
+    cand_atual = ler_json(pasta / "candidatos.json", [])
+    if (len(cand_atual) < a.quantos or forcar) and (pasta / "transcricao.json").exists() and (pasta / "volume.json").exists():
+        print(f"\n[Auto] Recalculando melhores trechos ({a.quantos}) com filtro anti-intro/doação usando transcrição já salva…", flush=True)
+        trans = ler_json(pasta / "transcricao.json", {"segmentos": []})
+        volume = ler_json(pasta / "volume.json", [])
+        chat = picos_do_chat(pasta)
+        candidatos(pasta, trans, volume, chat, quantos=max(a.quantos + 10, 15))
+    escolhidos = (pasta / "escolhidos.json").exists()
+    quantos_atual = len(ler_json(pasta / "escolhidos.json", {}).get("cortes", [])) if escolhidos else 0
+    if not escolhidos or not (pasta / ".auto").exists() or quantos_atual != a.quantos or forcar:
+        esc(pasta, a.quantos, auto=True)
+        (pasta / ".auto").write_text("ok")
+        tarefa.limpar(pasta, "fazer")
+    if forcar:
+        tarefa.limpar(pasta, "fazer")
+    if _rodar_trabalho(pasta, "fazer", [str(pasta), ""], a.esperar):
+        from comum import CORTES
+        print(f"\nCORTES PRONTOS em {CORTES / pasta.name}")
+
+
+def _trabalho(a):
+    """Roda em segundo plano (chamado pelo próprio clip.py)."""
+    import tarefa
+    pasta = Path(a.args[0])
+    if a.nome == "preparar":
+        from ouvir import trabalho_preparar
+        modelo, idioma, trechos = (a.args[1] or None), (a.args[2] or None), int(a.args[3] or 12)
+        tarefa.executar(pasta, "preparar", lambda: trabalho_preparar(pasta, modelo, idioma, trechos))
+    elif a.nome == "fazer":
+        from cortar import fazer as faz
+        tarefa.executar(pasta, "fazer", lambda: faz(pasta, a.args[1] or "small"))
+
+
+def status(_):
+    if not TRABALHO.exists() or not any(TRABALHO.iterdir()):
+        print("Nenhuma live ainda.")
+        return
+    for p in sorted(TRABALHO.iterdir()):
+        if not p.is_dir():
+            continue
+        info = ler_json(p / "info.json", {})
+        esc = ler_json(p / "escolhidos.json", {}).get("cortes")
+        prontos = len(list((CORTES / p.name).glob("corte_*.mp4")))
+        rodando = [n for n in ("preparar", "fazer") if (p / f".{n}.pid").exists()]
+        escutado = "sim" if (p / "candidatos.txt").exists() else f"{len(list((p / 'escuta').glob('*.json')))} partes"
+        print(f"{p.name}\n  {info.get('title', '')}\n  escutada: {escutado} | escolhidos: "
+              f"{len(esc) if esc else 0} | cortes prontos: {prontos}"
+              + (f" | RODANDO AGORA: {', '.join(rodando)}" if rodando else ""))
+
+
+def certificados():
+    """o Python do python.org (Mac) não acha os certificados sozinho: usa os do certifi"""
+    try:
+        import certifi
+        os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    except ImportError:
+        pass
+
+
+def utf8():
+    for f in (sys.stdout, sys.stderr):
+        try:
+            f.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def main():
+    utf8()
+    no_ambiente()
+    certificados()
+    if sys.argv[1:2] == ["tiktok"]:  # repassa tudo (inclusive --help) pra fila do TikTok
+        sys.exit(subprocess.run([sys.executable, str(AQUI / "tiktok_fila.py"), *sys.argv[2:]]).returncode)
+    ap = argparse.ArgumentParser(description="Clipper de cortes virais")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("instalar").set_defaults(f=instalar)
+    b = sub.add_parser("buscar")
+    b.add_argument("--quantas", type=int, default=7)
+    b.add_argument("--termos", nargs="+", default=["GTA 6 live", "GTA 6 ao vivo", "GTA VI stream"])
+    b.set_defaults(f=buscar)
+    p = sub.add_parser("preparar")
+    p.add_argument("links", nargs="+")
+    p.add_argument("--modelo", default=None, help="modelo de escuta (padrão: base; tiny em PC fraco)")
+    p.add_argument("--idioma", default=None, help="pt, en… (vazio = detecta sozinho)")
+    p.add_argument("--trechos", type=int, default=12, help="quantos trechos quentes a IA vai ler")
+    p.add_argument("--esperar", type=int, default=None, help="segundos acompanhando antes de devolver")
+    p.set_defaults(f=preparar)
+    e = sub.add_parser("escolher")
+    e.add_argument("live")
+    e.add_argument("--manter", type=int, default=3)
+    e.add_argument("--auto", action="store_true", help="ignora a IA e usa os trechos mais quentes")
+    e.add_argument("--perfil", choices=["impacto", "explicativo", "livre"], default="impacto",
+                   help="impacto 20-60 s (live/reação), explicativo 40-95 s (podcast/aula), livre (capítulos)")
+    e.set_defaults(f=escolher)
+    f = sub.add_parser("fazer")
+    f.add_argument("live")
+    f.add_argument("--modelo", default="small", help="modelo da legenda dos cortes")
+    f.add_argument("--estilo", choices=["auto", "split", "blur", "preencher"], default=None)
+    f.add_argument("--foco", type=float, default=None, help="só no estilo preencher: 0 esquerda, 0.5 centro, 1 direita")
+    f.add_argument("--esperar", type=int, default=None)
+    f.set_defaults(f=fazer)
+    t = sub.add_parser("automatico")
+    t.add_argument("link")
+    t.add_argument("--quantos", type=int, default=3)
+    t.add_argument("--estilo", choices=["auto", "split", "blur", "preencher"], default=None)
+    t.add_argument("--foco", type=float, default=None)
+    t.add_argument("--esperar", type=int, default=None)
+    t.set_defaults(f=automatico)
+    w = sub.add_parser("_trabalho")
+    w.add_argument("nome")
+    w.add_argument("args", nargs="*")
+    w.set_defaults(f=_trabalho)
+    sub.add_parser("status").set_defaults(f=status)
+    c = sub.add_parser("capitulos")
+    c.add_argument("live")
+    c.set_defaults(f=capitulos)
+    sub.add_parser("tiktok", help="fila de postagem no TikTok (clip tiktok --help)")
+    a = ap.parse_args()
+    if getattr(a, "esperar", 0) is None:
+        import tarefa
+        a.esperar = tarefa.ESPERA
+    if a.f is not instalar:
+        ffmpeg_embutido()
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+GTA 6 VIRAL CLIPPER - MEU USO
+
+1. Va em https://colab.research.google.com > Arquivo > Fazer upload > GTA6_Clipper_Colab.ipynb
+2. Ambiente de execucao > Alterar tipo > GPU T4 > Salvar
+3. Rode as celulas em ordem: 1 (Drive) > 2 (instalar; quando pedir, selecione clipper-codigo.zip) > 3 (gerar cortes)
+   A Celula 3 ja vem com o link da live, 2K, 60 fps e 2 cortes em paralelo.
+4. Outra live: troque LINK_DA_LIVE na Celula 3. Depois de refazer os cortes atuais, desmarque REFAZER_CORTES_EXISTENTES.
+5. Cortes (.mp4 + .txt) saem em Meu Drive/GTA6_Cortes (criada automaticamente pelo programa).

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.mp4
+.env
+cookies*.txt
+.ipynb_checkpoints/
+.DS_Store
